@@ -9,11 +9,16 @@ Ranking rules (applied in order):
    is built for each subgroup that is still tied (recursively).
 4. Teams still tied afterwards are ordered by overall goal difference,
    then overall goals scored, then team id (ascending).
+
+The same pass builds both the final ranking and the machine-readable
+decision tree (:func:`compute_explanation`): every tree node records the
+exact ordered list of members it contributes to the table, so flattening
+the tree reproduces the standings without a second sort.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import Literal, Protocol, Sequence
 
 
 class MatchLike(Protocol):
@@ -75,6 +80,100 @@ class _MiniRow:
     goals_for: int = 0
 
 
+@dataclass(frozen=True)
+class MiniLeagueRow:
+    """One team's line in a head-to-head mini-league table."""
+
+    team: str
+    points: int
+    goal_difference: int
+    goals_for: int
+
+
+@dataclass(frozen=True)
+class TieBreakRow:
+    """One team's line in the final overall-criteria tie-break."""
+
+    team: str
+    goal_difference: int
+    goals_for: int
+
+
+FinalCriterion = Literal["overall_goal_difference", "overall_goals_for", "team_id"]
+
+FINAL_CRITERIA: tuple[FinalCriterion, ...] = (
+    "overall_goal_difference",
+    "overall_goals_for",
+    "team_id",
+)
+
+
+@dataclass
+class FinalTieBreak:
+    """The terminal ruling for a subgroup the mini-leagues cannot split.
+
+    ``order`` is the final ranking of the subgroup produced by applying
+    overall goal difference, overall goals scored and then team id; it
+    is the same list stored on the owning partition.
+    """
+
+    order: list[str]
+    table: list[TieBreakRow]
+    criteria: tuple[FinalCriterion, ...] = FINAL_CRITERIA
+
+
+@dataclass
+class DecisionPartition:
+    """One ordered block produced by a node's mini-league.
+
+    Teams in the same partition share mini-league points, goal
+    difference and goals scored. Exactly one of ``child`` (the block was
+    partially separated and a fresh mini-league was rebuilt for it) or
+    ``tie_break`` (the whole node was inseparable) is set for a
+    multi-team block; both are ``None`` for a singleton block.
+    """
+
+    teams: list[str]
+    points: int
+    goal_difference: int
+    goals_for: int
+    child: "DecisionNode | None" = None
+    tie_break: FinalTieBreak | None = None
+
+
+@dataclass
+class DecisionNode:
+    """A head-to-head ruling over one point-tied group (or subgroup).
+
+    ``members`` is the final ranking contributed by this node, in
+    order; concatenating every node's members in tree order reproduces
+    the final standings. ``table`` lists the mini-league line of each
+    member in that same order. ``partitions`` are the ordered blocks
+    formed by the mini-league key (points, goal difference, goals
+    scored); their concatenation equals ``members``.
+    """
+
+    members: list[str]
+    table: list[MiniLeagueRow]
+    partitions: list[DecisionPartition] = field(default_factory=list)
+
+
+@dataclass
+class PointsGroup:
+    """All teams sharing one total-points value, with its ruling tree."""
+
+    points: int
+    teams: list[str]
+    decision: DecisionNode
+
+
+@dataclass
+class Explanation:
+    """The ordered point groups forming the root of the decision tree."""
+
+    points_groups: list[PointsGroup]
+
+
 def _mini_league(
     group: Sequence[str], matches: Sequence[MatchLike]
 ) -> dict[str, _MiniRow]:
@@ -111,24 +210,22 @@ def _overall_order(group: Sequence[str], stats: dict[str, TeamStats]) -> list[st
     )
 
 
-def _order_tied_group(
+def _build_decision_node(
     group: Sequence[str],
     matches: Sequence[MatchLike],
     stats: dict[str, TeamStats],
-) -> list[str]:
-    """Order a point-tied group via head-to-head mini-leagues.
+) -> DecisionNode:
+    """Build the head-to-head ruling node for a point-tied group.
 
-    Subgroups that remain tied get a fresh mini-league built only from
-    their mutual matches; groups that cannot be separated at all fall
-    back to the overall criteria.
+    The node's ``members`` list is the group's final ranking; it is the
+    sole ordering produced here and feeds both the standings and the
+    tree, so the two cannot drift apart.
     """
-    if len(group) == 1:
-        return list(group)
-
     table = _mini_league(group, matches)
     ordered = sorted(group, key=lambda t: _mini_key(table, t))
 
-    result: list[str] = []
+    partitions: list[DecisionPartition] = []
+    members: list[str] = []
     i = 0
     while i < len(ordered):
         j = i + 1
@@ -137,25 +234,70 @@ def _order_tied_group(
         ):
             j += 1
         block = ordered[i:j]
+        row = table[block[0]]
         if len(block) == 1:
-            result.extend(block)
+            # Separated outright by the mini-league key.
+            partition = DecisionPartition(
+                teams=list(block),
+                points=row.points,
+                goal_difference=row.goal_difference,
+                goals_for=row.goals_for,
+            )
         elif len(block) == len(group):
-            # The mini-league separates nothing: go to overall criteria.
-            result.extend(_overall_order(block, stats))
+            # The mini-league separates nothing: final overall criteria.
+            final_order = _overall_order(block, stats)
+            tie_break = FinalTieBreak(
+                order=list(final_order),
+                table=[
+                    TieBreakRow(
+                        team=team,
+                        goal_difference=stats[team].goal_difference,
+                        goals_for=stats[team].goals_for,
+                    )
+                    for team in final_order
+                ],
+            )
+            partition = DecisionPartition(
+                teams=list(final_order),
+                points=row.points,
+                goal_difference=row.goal_difference,
+                goals_for=row.goals_for,
+                tie_break=tie_break,
+            )
         else:
             # Partially separated: rebuild the mini-league for the
             # still-tied subgroup using only their mutual matches.
-            result.extend(_order_tied_group(block, matches, stats))
+            child = _build_decision_node(block, matches, stats)
+            partition = DecisionPartition(
+                teams=list(child.members),
+                points=row.points,
+                goal_difference=row.goal_difference,
+                goals_for=row.goals_for,
+                child=child,
+            )
+        partitions.append(partition)
+        members.extend(partition.teams)
         i = j
-    return result
+
+    return DecisionNode(
+        members=members,
+        table=[
+            MiniLeagueRow(
+                team=team,
+                points=table[team].points,
+                goal_difference=table[team].goal_difference,
+                goals_for=table[team].goals_for,
+            )
+            for team in members
+        ],
+        partitions=partitions,
+    )
 
 
-def compute_standings(
+def _aggregate_stats(
     teams: Sequence[str], matches: Sequence[MatchLike]
-) -> tuple[list[str], dict[str, TeamStats]]:
-    """Return the teams in final ranking order together with their stats."""
-    validate_input(teams, matches)
-
+) -> dict[str, TeamStats]:
+    """Accumulate the overall table from the completed matches."""
     stats = {team: TeamStats(team=team) for team in teams}
     for match in matches:
         home, away = stats[match.home], stats[match.away]
@@ -178,9 +320,19 @@ def compute_standings(
             away.draws += 1
             home.points += 1
             away.points += 1
+    return stats
+
+
+def _compute(
+    teams: Sequence[str], matches: Sequence[MatchLike]
+) -> tuple[list[str], dict[str, TeamStats], list[PointsGroup]]:
+    """Validate, aggregate and rank, producing standings and tree together."""
+    validate_input(teams, matches)
+    stats = _aggregate_stats(teams, matches)
 
     by_points = sorted(teams, key=lambda t: -stats[t].points)
     ordered: list[str] = []
+    groups: list[PointsGroup] = []
     i = 0
     while i < len(by_points):
         j = i + 1
@@ -190,9 +342,31 @@ def compute_standings(
         ):
             j += 1
         group = by_points[i:j]
-        if len(group) == 1:
-            ordered.extend(group)
-        else:
-            ordered.extend(_order_tied_group(group, matches, stats))
+        node = _build_decision_node(group, matches, stats)
+        ordered.extend(node.members)
+        groups.append(
+            PointsGroup(points=stats[group[0]].points, teams=node.members, decision=node)
+        )
         i = j
+    return ordered, stats, groups
+
+
+def compute_standings(
+    teams: Sequence[str], matches: Sequence[MatchLike]
+) -> tuple[list[str], dict[str, TeamStats]]:
+    """Return the teams in final ranking order together with their stats."""
+    ordered, stats, _ = _compute(teams, matches)
     return ordered, stats
+
+
+def compute_explanation(
+    teams: Sequence[str], matches: Sequence[MatchLike]
+) -> tuple[list[str], dict[str, TeamStats], Explanation]:
+    """Return the ranking, stats and the head-to-head decision tree.
+
+    The ranking is identical to :func:`compute_standings` because both
+    are read from the same computation; the tree's members concatenated
+    in order reproduce the returned ranking.
+    """
+    ordered, stats, groups = _compute(teams, matches)
+    return ordered, stats, Explanation(points_groups=groups)

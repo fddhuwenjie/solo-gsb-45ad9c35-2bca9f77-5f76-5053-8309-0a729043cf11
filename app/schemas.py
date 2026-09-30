@@ -43,6 +43,86 @@ class StandingsResponse(BaseModel):
     standings: list[StandingEntry]
 
 
+class MiniLeagueRowOut(BaseModel):
+    """One team's line in a head-to-head mini-league table."""
+
+    team: str
+    points: int
+    goal_difference: int
+    goals_for: int
+
+
+class TieBreakRowOut(BaseModel):
+    """One team's line in the final overall-criteria tie-break."""
+
+    team: str
+    goal_difference: int
+    goals_for: int
+
+
+class FinalTieBreakOut(BaseModel):
+    """Terminal ruling for a subgroup the mini-leagues cannot separate.
+
+    ``order`` lists the teams in their final relative order, produced by
+    the named ``criteria`` applied successively (overall goal
+    difference, overall goals scored, then team id); ``table`` carries
+    the underlying overall figures in that same order.
+    """
+
+    order: list[str]
+    table: list[TieBreakRowOut]
+    criteria: list[Literal["overall_goal_difference", "overall_goals_for", "team_id"]]
+
+
+class DecisionPartitionOut(BaseModel):
+    """One ordered block formed by a mini-league key.
+
+    Every team in the block shares mini-league ``points``,
+    ``goal_difference`` and ``goals_for``. A multi-team block carries
+    either a rebuilt ``child`` mini-league (partial separation) or a
+    ``tie_break`` ruling (the node could not separate anyone).
+    """
+
+    teams: list[str]
+    points: int
+    goal_difference: int
+    goals_for: int
+    child: "DecisionNodeOut | None" = None
+    tie_break: FinalTieBreakOut | None = None
+
+
+class DecisionNodeOut(BaseModel):
+    """A head-to-head ruling for one point-tied group (or subgroup).
+
+    ``members`` is the final relative order contributed by this node;
+    concatenating every node's members in tree order reproduces the
+    standings. ``table`` are the mini-league lines in that same order
+    and ``partitions`` are the ordered key-equal blocks.
+    """
+
+    members: list[str]
+    table: list[MiniLeagueRowOut]
+    partitions: list[DecisionPartitionOut]
+
+
+class PointsGroupOut(BaseModel):
+    """All teams sharing one total-points value, with its ruling node."""
+
+    points: int
+    teams: list[str]
+    decision: DecisionNodeOut
+
+
+class StandingsExplanationResponse(BaseModel):
+    """The same table as /standings plus the ranking decision tree."""
+
+    standings: list[StandingEntry]
+    points_groups: list[PointsGroupOut]
+
+
+DecisionPartitionOut.model_rebuild()
+
+
 class ScoreCandidate(BaseModel):
     """One possible score for an unplayed fixture."""
 
