@@ -6,30 +6,44 @@ from fastapi.responses import JSONResponse
 
 from .scenarios import compute_scenarios
 from .schemas import (
+    DecisionPartitionOut,
+    FinalVerdictRowOut,
     MatchIn,
+    MiniLeagueRowOut,
+    PointsGroupOut,
     QualificationRequest,
     QualificationResponse,
+    RankingExplanationOut,
     RoundRobinScheduleRequest,
     RoundRobinScheduleResponse,
     ScenarioEntry,
     ScheduledMatchOut,
     ScheduleRound,
     StandingEntry,
+    StandingsExplanationResponse,
     StandingsRequest,
     StandingsResponse,
 )
 from .scheduling import ScheduleValidationError, compute_schedule
-from .standings import StandingsValidationError, compute_standings
+from .standings import (
+    DecisionPartition,
+    PointsGroup,
+    StandingsValidationError,
+    compute_standings,
+    compute_standings_explained,
+)
 
 app = FastAPI(
     title="Round-Robin Standings API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Compute a round-robin league table from completed matches. "
         "Win = 3 points, draw = 1. Ties are broken by head-to-head "
         "mini-league (points, goal difference, goals scored, rebuilt "
         "recursively for still-tied subgroups), then overall goal "
         "difference, overall goals scored and team id. "
+        "POST /standings/explanation returns the same table together "
+        "with the machine-readable ranking decision tree. "
         "POST /qualification-scenarios enumerates the candidate scores "
         "of the remaining fixtures and reports each team's best and "
         "worst reachable rank (guaranteed / possible / eliminated "
@@ -56,14 +70,8 @@ async def schedule_validation_handler(
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
-@app.post(
-    "/standings",
-    response_model=StandingsResponse,
-    responses={422: {"description": "Invalid teams or matches"}},
-)
-def post_standings(payload: StandingsRequest) -> StandingsResponse:
-    """Compute the league table for the given teams and completed matches."""
-    ordered, stats = compute_standings(payload.teams, payload.matches)
+def _standing_entries(ordered, stats) -> list[StandingEntry]:
+    """Build /standings rows from the shared final order and stats."""
     entries = []
     for index, team in enumerate(ordered):
         row = stats[team]
@@ -81,7 +89,104 @@ def post_standings(payload: StandingsRequest) -> StandingsResponse:
                 points=row.points,
             )
         )
-    return StandingsResponse(standings=entries)
+    return entries
+
+
+def _mini_rows_out(members, mini_table) -> list[MiniLeagueRowOut]:
+    """Serialize a mini-league table, rows ordered by the group's order."""
+    return [
+        MiniLeagueRowOut(
+            team=team,
+            points=mini_table[team].points,
+            goal_difference=mini_table[team].goal_difference,
+            goals_for=mini_table[team].goals_for,
+        )
+        for team in members
+    ]
+
+
+def _partition_out(partition: DecisionPartition) -> DecisionPartitionOut:
+    """Serialize one node of the ranking decision tree."""
+    return DecisionPartitionOut(
+        kind=partition.kind,
+        members=list(partition.members),
+        team=partition.members[0] if partition.kind == "single" else None,
+        partitions=(
+            [_partition_out(child) for child in partition.partitions]
+            if partition.partitions is not None
+            else None
+        ),
+        mini_table=(
+            _mini_rows_out(partition.members, partition.mini_table)
+            if partition.mini_table is not None
+            else None
+        ),
+        final_table=(
+            [
+                FinalVerdictRowOut(
+                    team=row.team_id,
+                    goal_difference=row.goal_difference,
+                    goals_for=row.goals_for,
+                )
+                for row in partition.final_table
+            ]
+            if partition.final_table is not None
+            else None
+        ),
+    )
+
+
+def _points_group_out(group: PointsGroup) -> PointsGroupOut:
+    return PointsGroupOut(
+        points=group.points,
+        members=list(group.members),
+        mini_table=_mini_rows_out(group.members, group.mini_table),
+        partitions=[_partition_out(partition) for partition in group.partitions],
+    )
+
+
+@app.post(
+    "/standings",
+    response_model=StandingsResponse,
+    responses={422: {"description": "Invalid teams or matches"}},
+)
+def post_standings(payload: StandingsRequest) -> StandingsResponse:
+    """Compute the league table for the given teams and completed matches."""
+    ordered, stats = compute_standings(payload.teams, payload.matches)
+    return StandingsResponse(standings=_standing_entries(ordered, stats))
+
+
+@app.post(
+    "/standings/explanation",
+    response_model=StandingsExplanationResponse,
+    responses={422: {"description": "Invalid teams or matches"}},
+)
+def post_standings_explanation(
+    payload: StandingsRequest,
+) -> StandingsExplanationResponse:
+    """Compute the table and explain every ranking decision.
+
+    The ``standings`` rows are identical to POST /standings for the same
+    request. ``explanation`` groups teams by total points and records,
+    for each group, the head-to-head mini-league (points, goal
+    difference, goals scored) and its ordered partitions. Blocks still
+    tied after a mini-league carry a recursively rebuilt mini-league;
+    blocks the mini-league cannot separate at all carry the final
+    verdict (overall goal difference, overall goals scored, team id).
+    The members listed across the nodes, read in order, are exactly the
+    final standings.
+    """
+    ordered, stats, groups = compute_standings_explained(
+        payload.teams, payload.matches
+    )
+    explanation = RankingExplanationOut(
+        members=list(ordered),
+        groups=[_points_group_out(group) for group in groups],
+    )
+    return StandingsExplanationResponse(
+        standings=_standing_entries(ordered, stats),
+        explanation=explanation,
+    )
 
 
 @app.post(

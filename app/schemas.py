@@ -43,6 +43,76 @@ class StandingsResponse(BaseModel):
     standings: list[StandingEntry]
 
 
+class MiniLeagueRowOut(BaseModel):
+    """One team's line in a head-to-head mini-league table."""
+
+    team: str
+    points: int
+    goal_difference: int
+    goals_for: int
+
+
+class FinalVerdictRowOut(BaseModel):
+    """One team's line when overall criteria settle a still-tied block.
+
+    Teams are ordered by goal difference, then goals scored, then team id.
+    """
+
+    team: str
+    goal_difference: int
+    goals_for: int
+
+
+class DecisionPartitionOut(BaseModel):
+    """One ordered block at a mini-league level.
+
+    Exactly one resolution is present: a lone ``team`` when the
+    mini-league already decided the block, a nested ``mini_league``
+    rebuilt from the block's mutual matches, or a ``final`` verdict
+    using overall goal difference, overall goals scored and team id.
+    Concatenating every partition's members reproduces the parent
+    group's member order.
+    """
+
+    kind: Literal["single", "mini_league", "final"]
+    members: list[str]
+    team: str | None = None
+    partitions: list["DecisionPartitionOut"] | None = None
+    mini_table: list[MiniLeagueRowOut] | None = None
+    final_table: list[FinalVerdictRowOut] | None = None
+
+
+class PointsGroupOut(BaseModel):
+    """All teams sharing the same total points, in final ranking order."""
+
+    points: int
+    members: list[str]
+    mini_table: list[MiniLeagueRowOut]
+    partitions: list[DecisionPartitionOut]
+
+
+class RankingExplanationOut(BaseModel):
+    """Machine-readable ranking decision tree for the standings.
+
+    Groups are ordered by total points; within a group the ordered
+    partitions (recursively) give the exact final order.
+    """
+
+    criterion: Literal["total_points"] = "total_points"
+    members: list[str]
+    groups: list[PointsGroupOut]
+
+
+class StandingsExplanationResponse(BaseModel):
+    """The /standings table plus the decision tree behind its ordering."""
+
+    standings: list[StandingEntry]
+    explanation: RankingExplanationOut
+
+
+DecisionPartitionOut.model_rebuild()
+
+
 class ScoreCandidate(BaseModel):
     """One possible score for an unplayed fixture."""
 
